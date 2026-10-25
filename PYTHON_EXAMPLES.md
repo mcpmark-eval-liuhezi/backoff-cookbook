@@ -5,10 +5,10 @@ collecting every Python implementation found by the GitHub code searches. Each
 file was opened and read in full; the notes below describe what the code
 actually does.
 
-Four distinct Python approaches turned up, and notably they map to four
-different jitter flavors: symmetric multiplicative, additive, injectable full
-jitter, and a full strategy library containing both full and decorrelated
-jitter.
+Five distinct Python approaches turned up, and they map to five different
+jitter flavors: symmetric multiplicative, additive, jitter folded into the
+growth multiplier, injectable full jitter, and a full strategy library
+containing both full and decorrelated jitter.
 
 ---
 
@@ -71,7 +71,7 @@ wait_time = backoff_factor**attempt + random.uniform(0, 1)
 **What makes it worth reading:** unlike the multiplicative variants, this
 **adds** a random 0–1 s on top of the pure exponential value, so the shape of
 the curve is preserved exactly and only the collision-prone tail is softened.
-This is the only additive jitter in the whole survey. The decorator also
+This is the only purely additive jitter in the whole survey. The decorator also
 supports an `on_retry(attempt, exception)` callback invoked before sleeping,
 which is a simple and effective observability hook. The same file contains a
 `rate_limit` decorator that sleeps `random.uniform(min_delay, max_delay)`
@@ -81,14 +81,72 @@ between calls — a sibling pattern for throttling rather than retrying.
 
 ---
 
-## 3. yzs15/codex_proxy — injectable full jitter
+## 3. MaartenGr/KeyBERT — jitter folded into the growth multiplier
+
+**Repository:** [MaartenGr/KeyBERT](https://github.com/MaartenGr/KeyBERT)
+("Minimal keyword extraction with BERT")
+
+**File:** [`keybert/llm/_utils.py`](https://github.com/MaartenGr/KeyBERT/blob/main/keybert/llm/_utils.py)
+
+**Approach:** a function-returning-a-wrapper helper (rather than `@decorator`
+syntax) used by KeyBERT's LLM backends.
+
+**Core delay code:**
+
+```python
+def retry_with_exponential_backoff(
+    func,
+    initial_delay: float = 1,
+    exponential_base: float = 2,
+    jitter: bool = True,
+    max_retries: int = 10,
+    errors: tuple = None,
+):
+    """Retry a function with exponential backoff."""
+
+    def wrapper(*args, **kwargs):
+        num_retries = 0
+        delay = initial_delay
+
+        while True:
+            try:
+                return func(*args, **kwargs)
+
+            except errors:
+                num_retries += 1
+
+                if num_retries > max_retries:
+                    raise Exception(f"Maximum number of retries ({max_retries}) exceeded.")
+
+                delay *= exponential_base * (1 + jitter * random.random())
+                time.sleep(delay)
+
+            except Exception as e:
+                raise e
+
+    return wrapper
+```
+
+**What makes it worth reading:** the randomness is folded into the **growth
+multiplier** instead of being applied to the final value, so each retry
+multiplies the delay by `2 * (1 + U(0,1))` — between 2× and 4×. The jitter
+therefore compounds across attempts and the spread widens as the backoff
+grows, which is a genuinely different shape from either multiplicative-final
+or additive jitter. Note also that `errors` is a tuple selecting which
+exception types are retriable; anything else is re-raised immediately.
+
+**Jitter flavor:** multiplicative, folded into the per-retry growth factor.
+
+---
+
+## 4. yzs15/codex_proxy — injectable full jitter
 
 **Repository:** [yzs15/codex_proxy](https://github.com/yzs15/codex_proxy)
 
 **File:** [`codex_proxy/backoff.py`](https://github.com/yzs15/codex_proxy/blob/main/codex_proxy/backoff.py)
 
 **Approach:** a tiny, dependency-free `Backoff` dataclass where the jitter
-itself is a injectable callable field.
+itself is an injectable callable field.
 
 **Core delay code:**
 
@@ -130,7 +188,7 @@ anywhere in the survey and is directly borrowable.
 
 ---
 
-## 4. dagdelenemre/nopanic — a full strategy library
+## 5. dagdelenemre/nopanic — a full strategy library
 
 **Repository:** [dagdelenemre/nopanic](https://github.com/dagdelenemre/nopanic)
 ("Unified resilience toolkit for Python: retry, circuit breaker, timeout, rate
@@ -159,7 +217,6 @@ class full_jitter:
             yield random.uniform(0.0, min(delay, self.cap))
             delay *= self.factor
 
-
 @dataclass(frozen=True, slots=True)
 class decorrelated_jitter:
     """Decorrelated jitter: each delay is uniform(base, previous*3), capped."""
@@ -183,24 +240,9 @@ dataclasses: "cheap, hashable and safe to share between policies; each
 execution of a policy starts a fresh iterator" — a direct fix for the state
 leak you'd otherwise get from sharing one iterator across concurrent retries.
 The module also contains the most thoughtful comment on RNG choice in the
-survey: jitter deliberately uses the stdlib PRNG because "it shapes load, it is
-not a security boundary, and a CSPRNG would add cost for no benefit," with the
-corresponding S311 lint rule suppressed project-wide.
+survey: jitter deliberately uses the stdlib PRNG because "it shapes load, it
+is not a security boundary, and a CSPRNG would add cost for no benefit," with
+the corresponding S311 lint rule suppressed project-wide.
 
 **Jitter flavor:** full jitter **and** decorrelated jitter, as first-class
 interchangeable strategies behind one protocol.
-
----
-
-## At a glance
-
-| # | Repository | File | Jitter shape | Statefulness |
-|---|-----------|------|--------------|--------------|
-| 1 | Blazemeter/taurus | `bzt/bza_retry.py` | multiplicative ±25% | config object |
-| 2 | helallao/perplexity-ai | `perplexity/utils.py` | additive `+uniform(0,1)` | decorator-local |
-| 3 | yzs15/codex_proxy | `codex_proxy/backoff.py` | full jitter (injectable) | stateless |
-| 4 | dagdelenemre/nopanic | `src/nopanic/backoff.py` | full + decorrelated | per-iteration iterator |
-
-Together these four show the full range a Python team has to choose from: a
-pragmatic HTTP-aware decorator, a one-line additive jitter, a deliberately
-minimal testable core, and a complete interchangeable-strategy library.
